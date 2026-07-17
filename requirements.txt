@@ -1,0 +1,9 @@
+# Базова (офлайн) версія:
+numpy
+
+# --- Опційно, для продакшн-версії (справжні embeddings + LLM + vector DB) ---
+# openai            # embeddings text-embedding-3-small + LLM
+# chromadb          # векторна база
+# sentence-transformers   # локальні dense-embeddings (альтернатива OpenAI)
+# pypdf             # завантаження .pdf
+# python-docx       # завантаження .docx

@@ -1,0 +1,29 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+
+# === IDEs / Editors ===
+# JetBrains (PyCharm, WebStorm тощо)
+.idea/
+*.iws
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# === OS temporary files ===
+.DS_Store
+.DS_Store?
+ehthumbs.db
+Thumbs.db
+
+# === Secrets / Local Configs ===
+.env
+.env.local
+.env.*.local

@@ -24,12 +24,12 @@ import sys
 from pathlib import Path
 import math
 from dataclasses import dataclass, field
+from sys import set_coroutine_origin_tracking_depth
 from typing import List, Dict, Optional
 from collections import Counter
 import numpy as np
-from google import genai
-from google.genai import types
-from dotenv import load_dotenv
+
+
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(BASE, "docs")
@@ -38,10 +38,6 @@ DOCS_DIR = os.path.join(BASE, "docs")
 SIM_THRESHOLD = 0.22
 NOT_FOUND = "Не знайшов інформації у наданій документації."
 
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-load_dotenv()
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ==================================================================
 # 1) Завантаження документів
@@ -107,28 +103,60 @@ def chunk_documents(docs: List[Dict]) -> List[Chunk]:
 
 
 # ==================================================================
-# 3) Embeddings
+# 3) Embeddings (за замовчуванням — локальний TF-IDF)
 # ==================================================================
 
 
-class GeminiEmbedder:
-    """Генерація векторів через офіційне API Google."""
 
-    def embed_text(self, text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
-        try:
-            result = client.models.embed_content(
-                model="gemini-embedding-001",
-                contents=text,
-                config=types.EmbedContentConfig(
-                    task_type=task_type
-                )
-            )
-            # Повертаємо вектор як numpy array
-            return np.array(result.embeddings[0].values)
-        except Exception as e:
-            print(f"API Error generating embedding: {e}")
-            # fallback на нульовий вектор у разі помилки мережі
-            return np.zeros(768)
+class TfidfEmbedder:
+    """Локальний embedder без зовнішніх сервісів. Реалізує .fit() і .encode()."""
+
+    def __init__(self):
+        self.vocabulary = {}
+        self.idf_vector: Optional[np.ndarray] = None
+        self.num_docs= 0
+
+    def tokenize(self, text: str) -> List[str]:
+        return re.findall(r"[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]+", text.lower())
+
+    def fit(self, texts: List[str]):
+        self.num_documents = len(texts)
+        if self.num_documents == 0:
+            return self
+
+        tokenized_docs = [self.tokenize(doc) for doc in texts]
+        unique_words = sorted(list(set(word for doc in tokenized_docs for word in doc)))
+        self.vocabulary = {word: idx for idx, word in enumerate(unique_words)}
+        doc_counts = Counter()
+        for doc in tokenized_docs:
+            for word in set(doc):
+                doc_counts[word] += 1
+        idf_list = []
+        for word in unique_words:
+            docs_with_word = doc_counts[word]
+            idf_value = math.log((1 + self.num_documents) / (1 + docs_with_word)) + 1
+            idf_list.append(idf_value)
+        self.idf_vector = np.array(idf_list)
+        return self
+
+
+    def encode(self, text: List[str]) -> np.ndarray:
+        tokens = self.tokenize(text)
+        vocab_size = len(self.vocabulary)
+        vector = np.zeros(vocab_size)
+
+        if len(tokens) == 0 or vocab_size == 0:
+            return vector
+        term_counts = Counter(tokens)
+        total_tokens = len(tokens)
+        tf_vector = np.zeros(vocab_size)
+        for word, count in term_counts.items():
+            if word in self.vocabulary:
+                word_idx = self.vocabulary[word]
+                tf_vector[word_idx] = count / total_tokens
+
+        vector = tf_vector * self.idf_vector
+        return vector
 # ==================================================================
 # 4) Векторне сховище (in-memory, косинусний пошук)
 # ==================================================================
@@ -151,7 +179,7 @@ class InMemoryVectorStore:
         else:
             self.embeddings = np.vstack([self.embeddings, embeddings])
 
-    def query(self, qvec: np.ndarray, k: int = 3, threshold: float = 0.0) -> List[Hit]:
+    def query(self, qvec: np.ndarray, k: int = 3) -> List[Hit]:
         if self.embeddings is None or len(self.chunks) == 0:
             return []
         dot_products = np.dot(self.embeddings, qvec)
@@ -159,17 +187,12 @@ class InMemoryVectorStore:
         norm_qvec = np.linalg.norm(qvec)
 
         scores = dot_products / (norm_embeddings * norm_qvec + 1e-9)
-        valid_indices = np.where(scores >= threshold)[0]
-        if len(valid_indices) == 0:
-            return []
-        sorted_valid = valid_indices[np.argsort(scores[valid_indices])[::-1]]
-        top_indeces = sorted_valid[:k]
-
+        top_indeces = np.argsort(scores)[::-1][:k]
         hits = []
         for idx in top_indeces:
             hit = Hit(
                 chunk=self.chunks[idx],
-                score=float(scores[idx])
+                score = float(scores[idx])
             )
             hits.append(hit)
 
@@ -190,66 +213,57 @@ class Answer:
     grounded: bool = True
     hits: List[Hit] = field(default_factory=list)
 
+    def __str__(self):
+        if not self.citations:
+            return self.text
+        return f"{self.text}\n   ↳ Source: {'; '.join(self.citations)}"
 
-def generate_answer(query: str, hits: List[Hit]) -> Answer:
-    """Генерує фінальну відповідь на основі знайденого контексту."""
-    if not hits:
-        return Answer(text=NOT_FOUND, citations=None, grounded=False, hits=hits)
-    context_parts = [
-        f"[Source: {hit.chunk.source}, Section: {hit.chunk.section}]\n{hit.chunk.text}"
-        for hit in hits
-    ]
-    context = "\n\n---\n\n".join(context_parts)
-    system_instruction = (
-        "You are a helpful grounded QA assistant. "
-        "Answer the user's question strictly using only the provided context. "
-        "If the context does not contain the answer, reply exactly with: "
-        "\"Не знайшов інформації у наданій документації.\". "
-        "Do not make up facts or use external knowledge."
-        "Instead of the raw fact from the document, improve it to be less robotic to user"
-        "Every response should be strictly in English"
-    )
-    prompt = f"Context:\n{context}\n\nQuestion: {query}"
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.2
-        )
-    )
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    denom = np.linalg.norm(a) * np.linalg.norm(b) + 1e-9
+    return float(np.dot(a, b) / denom)
+
+def generate_answer(query: str, hits: List[Hit], embedder) -> Answer:
+    """За замовчуванням — extractive grounded answer.
+    Бере найрелевантніше речення з top-контексту й додає citations."""
     top_hit = hits[0]
-    answer_text = response.text.strip()
-    if answer_text.startswith(NOT_FOUND):
-        return Answer(text=answer_text, citations=None, grounded=False, hits=hits)
+    sentences = split_sentences(top_hit.chunk.text)
+
+    if not sentences:
+        best_sentence = top_hit.chunk.text
+    else:
+        qvec = embedder.encode(query)
+        similar = [_cosine(embedder.encode(s), qvec) for s in sentences]
+        best_sentence = sentences[int(np.argmax(similar))]
+
     citations = [f"{top_hit.chunk.source}"]
-    return Answer(text=answer_text, citations=citations, grounded=True, hits=hits)
+    return Answer(text=best_sentence, citations=citations, grounded=True, hits=hits)
+
 
 # ==================================================================
 # 6) Сам бот
 # ==================================================================
 class GroundedQABot:
     def __init__(self, embedder=None, store=None, threshold: float = SIM_THRESHOLD):
-        self.embedder = GeminiEmbedder()
+        self.embedder = TfidfEmbedder()
         self.store = InMemoryVectorStore()
         self.threshold = threshold
 
     def index(self, docs_dir: str = DOCS_DIR):
         docs = load_documents(docs_dir)
         chunks = chunk_documents(docs)
+        texts = [c.text for c in chunks]
 
-        embeddings_list = []
-        for c in chunks:
-            vec = self.embedder.embed_text(c.text, task_type="RETRIEVAL_DOCUMENT")
-            embeddings_list.append(vec)
-        embeddings = np.array(embeddings_list)
+        self.embedder.fit(texts)
+        embeddings = np.array([self.embedder.encode(t) for t in texts])
         self.store.add(embeddings, chunks)
         return self
 
     def ask(self, question: str, k: int = 3) -> Answer:
-        qvec = self.embedder.embed_text(question, task_type="RETRIEVAL_QUERY")
-        hits = self.store.query(qvec, k=k, threshold= self.threshold)
-        return generate_answer(question, hits)
+        qvec = self.embedder.encode(question)
+        hits = self.store.query(qvec, k=k)
+        if not hits or hits[0].score < self.threshold:
+            return Answer(text=NOT_FOUND, citations=[], grounded=False, hits=hits)
+        return generate_answer(question, hits, self.embedder)
 
 # ==================================================================
 # 7) Демонстрація
